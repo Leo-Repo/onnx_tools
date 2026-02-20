@@ -740,9 +740,18 @@ class Graph():
                     pro_node.output[0] = node.output[0]
         self.nodemap.pop(nodename)
 
-    def fuse_subgraph_node_names(self, nodes: [str], nodeop: str, nodename: str, keep_attr=True):
+    def fuse_subgraph_node_names(
+            self,
+            nodes: [str],
+            nodeop: str,
+            nodename: str = None,
+            keep_attr=True,
+            nodedomain: str = '',
+            name: str = None):
+        if nodename is None:
+            nodename = name if name is not None else nodes[0]
         _inputs, _outputs = self.get_iotensors(nodes, remove_initials=False)
-        newnode_prot = onnx.helper.make_node(nodeop, _inputs, _outputs, name=nodename)
+        newnode_prot = onnx.helper.make_node(nodeop, _inputs, _outputs, name=nodename, domain=nodedomain)
         count = 0
         if keep_attr:
             for node in nodes:
@@ -1316,6 +1325,15 @@ class Graph():
 
     def get_compute_graph(self):
         cg = copy.copy(self)
+        # Avoid mutating original graph: shallow-copy mutable containers.
+        cg.nodemap = copy.copy(self.nodemap)
+        cg.tensormap = copy.copy(self.tensormap)
+        cg.producedby = copy.deepcopy(self.producedby)
+        cg.consumedby = copy.deepcopy(self.consumedby)
+        cg.initials = copy.copy(self.initials)
+        cg.dynamics = copy.copy(self.dynamics)
+        cg.input = copy.copy(self.input)
+        cg.output = copy.copy(self.output)
         nodes = []
         rmnodes = []
         for key in cg.nodemap.keys():
@@ -1338,12 +1356,12 @@ class Graph():
                 rmnodes.append(key)
                 searchnodes = [key]
                 while len(searchnodes) > 0:
-                    this_node = self.nodemap[searchnodes[0]]
+                    this_node = cg.nodemap[searchnodes[0]]
                     searchnodes.pop(0)
                     for input in this_node.input:
-                        if input in self.producedby:
-                            if len(self.consumedby[input]) == 1:
-                                pnodename = self.producedby[input][0]
+                        if input in cg.producedby:
+                            if len(cg.consumedby[input]) == 1:
+                                pnodename = cg.producedby[input][0]
                                 if pnodename not in rmnodes:
                                     rmnodes.append(pnodename)
                                 searchnodes.append(pnodename)
@@ -1359,9 +1377,12 @@ class Graph():
         cg.dynamics.extend(cg.output)
         for name in cg.nodemap.keys():
             for output in cg.nodemap[name].output:
-                if name not in cg.dynamics:
+                if output not in cg.dynamics:
                     cg.dynamics.append(output)
 
+        # Removing nodes can break topological order for some models.
+        # Reorder once to make shape/value inference deterministic.
+        cg.graph_reorder_nodes()
         return cg
 
     def profile(self, exclude_ops = None):

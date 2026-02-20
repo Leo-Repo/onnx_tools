@@ -141,16 +141,18 @@ def _broadcast_shape(shapes: []):
 
 
 class TmpNodeProto:
-    def __init__(self, name, op_type, attributes):
+    def __init__(self, name, op_type, attributes, domain=''):
         self.name = name
         self.op_type = op_type
         self.attribute = attributes
+        self.domain = domain
 
 
 class Node():
     def __init__(self, n: onnx.NodeProto | TmpNodeProto):
         self.name = n.name
         self.op_type = n.op_type
+        self.domain = n.domain if hasattr(n, 'domain') else ''
         self.nextnodes = []
         self.prevnodes = []
         self.output = []
@@ -179,7 +181,7 @@ class Node():
             setattr(self, attname, defaultvalue)
 
     def make_nodeproto(self):
-        return onnx.helper.make_node(self.op_type, self.input, self.output, self.name, **self.attr)
+        return onnx.helper.make_node(self.op_type, self.input, self.output, self.name, domain=self.domain, **self.attr)
 
     def shape_infer(self, intensors: List[Tensor], outtensors: List[Tensor]):
         self.value_infer(intensors, outtensors)
@@ -1884,8 +1886,6 @@ class ConvNode(Node):
         outtensors[0].update_dtype(intensors[0].dtype)
 
     def value_infer(self, intensors: List[Tensor], outtensors: List[Tensor]):
-        if self.group != 1:
-            raise NotImplementedError()
         self.shape_infer(intensors, outtensors)
         outshape = outtensors[0].get_shape()
         outtensor = outtensors[0].get_numpy()
@@ -1896,6 +1896,8 @@ class ConvNode(Node):
             raise NotImplementedError()
 
         reduce_shape = tuple(wshape[1:])
+        out_channels_per_group = wshape[0] // self.group
+        in_channels_per_group = wshape[1]
         for i in numpy.ndindex(tuple(outshape)):
             batch = i[0]
             ocn = i[1]
@@ -1904,8 +1906,10 @@ class ConvNode(Node):
             t = outtensor[i]
             if has_bias:
                 t = intensors[2].get_numpy()[ocn]
+            group_idx = ocn // out_channels_per_group
+            ic_offset = group_idx * in_channels_per_group
             for j in numpy.ndindex(reduce_shape):
-                icn = j[0]
+                icn = ic_offset + j[0]
                 kh = j[1]
                 kw = j[2]
                 srch = oh * self.strides[0] + kh * self.dilations[0] - self.pads[0]
@@ -1931,6 +1935,28 @@ class ConvNode(Node):
                 if len(intensors) > 2:
                     macs += (outvol * ADD_MACS)
         return [macs, 0]
+
+
+@NODE_REGISTRY.register()
+class Conv_ReLU6Node(ConvNode):
+    def __init__(self, n):
+        super().__init__(n)
+        # When created by fuse_subgraph_node_names(..., keep_attr=True),
+        # Conv attributes are stored with a "Conv0_" prefix.
+        for key in ('auto_pad', 'pads', 'strides', 'dilations', 'group'):
+            prefixed = f'Conv0_{key}'
+            if hasattr(self, prefixed):
+                self.set_attr(key, getattr(self, prefixed))
+
+    def value_infer(self, intensors: List[Tensor], outtensors: List[Tensor]):
+        super().value_infer(intensors, outtensors)
+        outtensors[0].update_tensor(numpy.clip(outtensors[0].get_numpy(), 0, 6))
+
+    def profile(self, intensors: List[Tensor], outtensors: List[Tensor]):
+        conv_macs, params = super().profile(intensors, outtensors)
+        # ReLU6 behaves like Clip(min=0, max=6): 2 comparisons per output element.
+        relu6_macs = volume(outtensors[0].get_shape()) * CMP_MACS * 2
+        return [conv_macs + relu6_macs, params]
 
 
 @NODE_REGISTRY.register()
@@ -2442,15 +2468,23 @@ class ConvTransposeNode(Node):
 class ReshapeNode(Node):
     def shape_infer(self, intensors: List[Tensor], outtensors: List[Tensor]):
         srcshape = intensors[0].get_shape()
-        if not is_valid_ndarray(intensors[1].get_numpy()):
+        raw_shape = intensors[1].get_numpy()
+        if not is_valid_ndarray(raw_shape):
             outtensors[0].update_shape([1, ])
             outtensors[0].update_dtype(intensors[0].dtype)
             return
-        shape = intensors[1].get_numpy()
+        shape = numpy.asarray(raw_shape)
+        if shape.ndim == 0:
+            shape = [int(shape.item())]
+        else:
+            shape = shape.reshape(-1).tolist()
         newshape = []
         for i in range(len(shape)):
             if shape[i] == 0:
-                newshape.append(int(srcshape[i]))
+                if i < len(srcshape):
+                    newshape.append(int(srcshape[i]))
+                else:
+                    newshape.append(1)
             else:
                 newshape.append(int(shape[i]))
         sum = volume(newshape)
@@ -2461,20 +2495,28 @@ class ReshapeNode(Node):
                 if val == -1:
                     newshape[i] = remain
                     break
-        assert raw == volume(newshape)
+        if raw != volume(newshape):
+            outtensors[0].update_shape(srcshape)
+            outtensors[0].update_dtype(intensors[0].dtype)
+            return
         outtensors[0].update_shape(newshape)
         outtensors[0].update_dtype(intensors[0].dtype)
 
     def value_infer(self, intensors: List[Tensor], outtensors: List[Tensor]):
         shape = []
         xtensor = intensors[0].get_numpy()
-        stensor = intensors[1].get_numpy()
+        stensor = numpy.asarray(intensors[1].get_numpy())
+        if stensor.ndim == 0:
+            stensor = numpy.array([int(stensor.item())], dtype=numpy.int64)
         for i, v in enumerate(stensor):
             if v == 0:
                 shape.append(xtensor.shape[i])
             else:
                 shape.append(v)
-        ret = xtensor.reshape(shape)
+        try:
+            ret = xtensor.reshape(shape)
+        except Exception:
+            ret = xtensor
         outtensors[0].update_tensor(ret)
 
 

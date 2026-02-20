@@ -185,7 +185,7 @@ def model_opfusion(m, op_type: str, op_name: str, save_file: str, in_tensor_name
     model = loadmodel(m)
     graph = model.graph
     if in_tensor_names is not None and out_tensor_names is not None:
-        graph.fuse_subgraph_iotensors(inputs=in_tensor_names, outputs=out_tensor_names, name=op_name,
+        graph.fuse_subgraph_iotensors(inputs=in_tensor_names, outputs=out_tensor_names, name_prefix=op_name,
                                       nodeop=op_type, keep_attr=keep_attr)
         model.save_model(save_file)
     if nodenames is not None:
