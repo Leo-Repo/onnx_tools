@@ -771,8 +771,17 @@ class TransposeNode(Node):
         if self.perm is None:
             yshape = xshape[::-1]
         else:
-            for axis in self.perm:
-                yshape.append(xshape[axis])
+            rank = len(xshape)
+            # Be tolerant to temporary rank/perm mismatches during partial shape inference.
+            if rank == 0:
+                yshape = []
+            else:
+                for axis in self.perm:
+                    a = axis + rank if axis < 0 else axis
+                    if 0 <= a < rank:
+                        yshape.append(xshape[a])
+                if len(yshape) == 0:
+                    yshape = xshape[::-1]
         outtensors[0].update_shape(yshape)
         outtensors[0].update_dtype(intensors[0].dtype)
 
@@ -944,10 +953,31 @@ class ConstantNode(Node):
 @NODE_REGISTRY.register()
 class ConcatNode(Node):
     def shape_infer(self, intensors: List[Tensor], outtensors: List[Tensor]):
-        outshape = intensors[0].get_shape()
-        for i in range(len(intensors) - 1):
-            shape = intensors[i + 1].get_shape()
-            outshape[self.axis] += shape[self.axis]
+        shapes = [list(t.get_shape()) for t in intensors]
+        if len(shapes) == 0:
+            outtensors[0].update_shape([])
+            outtensors[0].update_dtype(intensors[0].dtype)
+            return
+
+        # Use max rank to make axis normalization robust when some inputs
+        # temporarily carry incomplete/empty shapes during shape inference.
+        rank = max(len(s) for s in shapes)
+        if rank == 0:
+            outtensors[0].update_shape([])
+            outtensors[0].update_dtype(intensors[0].dtype)
+            return
+
+        axis = _axes_neg2pos(rank, [self.axis])[0]
+
+        norm_shapes = []
+        for s in shapes:
+            if len(s) < rank:
+                s = [1] * (rank - len(s)) + s
+            norm_shapes.append(s)
+
+        outshape = norm_shapes[0].copy()
+        for s in norm_shapes[1:]:
+            outshape[axis] += s[axis]
         outtensors[0].update_shape(outshape)
         outtensors[0].update_dtype(intensors[0].dtype)
 
@@ -1148,6 +1178,7 @@ class ResizeNode(Node):
         xshape = intensors[0].get_shape()
         roi = []
         sizes = []
+        scales = None
         if len(intensors) == 2:
             scales = intensors[1].get_numpy()
         elif len(intensors) >= 3:
@@ -1157,15 +1188,17 @@ class ResizeNode(Node):
                 sizes = intensors[3].get_numpy()
 
         newshape = []
-        if is_valid_ndarray(sizes):
-            if len(sizes) == len(xshape):
-                newshape = sizes
-            if len(sizes) == 2:
-                newshape = xshape[:2] + sizes
+        sizes_arr = numpy.asarray(sizes) if is_valid_ndarray(sizes) else None
+        if sizes_arr is not None and sizes_arr.ndim > 0:
+            if len(sizes_arr) == len(xshape):
+                newshape = sizes_arr
+            elif len(sizes_arr) == 2:
+                newshape = list(xshape[:2]) + list(sizes_arr)
         else:
-            if is_valid_ndarray(scales):
+            scales_arr = numpy.asarray(scales) if is_valid_ndarray(scales) else None
+            if scales_arr is not None and scales_arr.ndim > 0:
                 newshape = []
-                for src, scale in zip(xshape, scales):
+                for src, scale in zip(xshape, scales_arr):
                     newshape.append(math.floor(src * scale))
 
         if is_valid_ndarray(newshape):
@@ -1957,6 +1990,31 @@ class Conv_ReLU6Node(ConvNode):
         # ReLU6 behaves like Clip(min=0, max=6): 2 comparisons per output element.
         relu6_macs = volume(outtensors[0].get_shape()) * CMP_MACS * 2
         return [conv_macs + relu6_macs, params]
+
+
+@NODE_REGISTRY.register()
+class Conv_SiluNode(ConvNode):
+    def __init__(self, n):
+        super().__init__(n)
+        # When created by fuse_subgraph_node_names(..., keep_attr=True),
+        # Conv attributes are stored with a "Conv0_" prefix.
+        for key in ('auto_pad', 'pads', 'strides', 'dilations', 'group'):
+            prefixed = f'Conv0_{key}'
+            if hasattr(self, prefixed):
+                self.set_attr(key, getattr(self, prefixed))
+
+    def value_infer(self, intensors: List[Tensor], outtensors: List[Tensor]):
+        super().value_infer(intensors, outtensors)
+        x = outtensors[0].get_numpy()
+        y = x * (1.0 / (1.0 + numpy.exp(-x)))
+        outtensors[0].update_tensor(y)
+
+    def profile(self, intensors: List[Tensor], outtensors: List[Tensor]):
+        conv_macs, params = super().profile(intensors, outtensors)
+        outvol = volume(outtensors[0].get_shape())
+        # SiLU: x * sigmoid(x), sigmoid(x) ~= exp + add + div.
+        silu_macs = outvol * (EXP_MACS + ADD_MACS + DIV_MACS + MUL_MACS)
+        return [conv_macs + silu_macs, params]
 
 
 @NODE_REGISTRY.register()
