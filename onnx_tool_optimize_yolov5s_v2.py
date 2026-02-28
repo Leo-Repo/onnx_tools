@@ -14,6 +14,7 @@ from onnx_tool.tensor import Tensor, volume
 
 INPUT_MODEL = Path(r"D:\projects\AIInfra\onnx-tool\data\public\yolov5\yolov5s_noPostprocess.onnx")
 OUTPUT_MODEL = Path(r"D:\projects\AIInfra\onnx-tool\data\public\yolov5\yolov5s_noPostprocess_optimized.onnx")
+OUTPUT_MODEL_DEDUP = Path(r"D:\projects\AIInfra\onnx-tool\data\public\yolov5\yolov5s_noPostprocess_optimized_dedup.onnx")
 MODEL_INPUT_NAME = "images"
 VERIFY_INPUT_SHAPE = (1, 3, 640, 640)
 
@@ -75,6 +76,8 @@ def register_fused_ops() -> None:
                 prefixed = f"Conv0_{key}"
                 if hasattr(self, prefixed):
                     self.set_attr(key, getattr(self, prefixed))
+                elif hasattr(self, key):
+                    self.set_attr(key, getattr(self, key))
 
             self.pool_kernel_shape = tuple(getattr(self, "MaxPool1_kernel_shape", (3, 3)))
             self.pool_ceil_mode = int(getattr(self, "MaxPool1_ceil_mode", 0))
@@ -345,7 +348,44 @@ def ensure_custom_domain_opset(model_path: Path, domain: str = "ai.custom", vers
         onnx.save(model, str(model_path))
 
 
-def optimize_yolov5(input_model: Path = INPUT_MODEL, output_model: Path = OUTPUT_MODEL) -> None:
+def _attr_to_pyval(attr):
+    val = onnx.helper.get_attribute_value(attr)
+    if isinstance(val, np.ndarray):
+        return val.tolist()
+    if isinstance(val, tuple):
+        return list(val)
+    return val
+
+
+def deduplicate_fused_attributes(input_model_path: Path, output_model_path: Path) -> int:
+    model = onnx.load(str(input_model_path))
+    removed = 0
+    conv_keys = {"dilations", "group", "kernel_shape", "pads", "strides"}
+
+    for node in model.graph.node:
+        if node.op_type not in ("Conv_Silu", "Conv_MaxPool"):
+            continue
+        attrs = list(node.attribute)
+        has_prefixed = {a.name[len("Conv0_") :] for a in attrs if a.name.startswith("Conv0_")}
+        keep = []
+        for a in attrs:
+            # Keep source-disambiguated names and remove ambiguous duplicates.
+            if a.name in conv_keys and a.name in has_prefixed:
+                removed += 1
+                continue
+            keep.append(a)
+        del node.attribute[:]
+        node.attribute.extend(keep)
+
+    onnx.save(model, str(output_model_path))
+    return removed
+
+
+def optimize_yolov5(
+    input_model: Path = INPUT_MODEL,
+    output_model: Path = OUTPUT_MODEL,
+    output_model_dedup: Path = OUTPUT_MODEL_DEDUP,
+) -> None:
     register_fused_ops()
 
     optimized_model = onnx_tool.Model(str(input_model))
@@ -371,15 +411,19 @@ def optimize_yolov5(input_model: Path = INPUT_MODEL, output_model: Path = OUTPUT
     output_model.parent.mkdir(parents=True, exist_ok=True)
     optimized_model.save_model(str(output_model), no_shape=True)
     ensure_custom_domain_opset(output_model)
+    removed_dup_attrs = deduplicate_fused_attributes(output_model, output_model_dedup)
+    ensure_custom_domain_opset(output_model_dedup)
 
     print(f"Input model:  {input_model}")
     print(f"Output model: {output_model}")
+    print(f"Output model (dedup attrs): {output_model_dedup}")
     print(f"Fused Conv+Silu: {fused_conv_silu}")
     print(f"Inserted 1x1 identity Conv before MaxPool: {len(inserted_convs)}")
     print(f"Fused Conv+MaxPool: {fused_conv_maxpool}")
     print(f"Removed Resize sizes branches: {removed_shape_branches}")
     print(f"Output match ({verify.method}): {verify.allclose}")
     print(f"Per-output max abs diff: {verify.per_output_max_abs_diff}")
+    print(f"Removed duplicated fused attributes: {removed_dup_attrs}")
 
 
 if __name__ == "__main__":
